@@ -1,0 +1,5 @@
+id,nombre,direccion,turno_dia,turno_noche,requiere_supervisor,lat,lon,estado_contrato
+E1,Noramco,"Calle E Lote 18-A, Parque Industrial Escuadrón, Coronel, Región del Biobío",1,1,False,-37.052,-73.138,activo
+E2,ITI Chile,"Avenida Golfo de Arauco 1006, Parque Industrial Coronel, Coronel, Región del Biobío",2,2,False,-37.041,-73.145,activo
+E3,Oleoducto,"Camino a Lenga 3381, Hualpén, Talcahuano, Bío Bío",4,0,True,-36.793,-73.118,activo
+E4,Indama,"Av. Manuel Rodríguez 2881, Chiguayante, Bío Bío",2,2,False,-36.922,-72.990,activo
