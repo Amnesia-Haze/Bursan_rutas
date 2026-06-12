@@ -8,3 +8,5 @@ folium>=0.16
 streamlit-folium>=0.20
 geopy>=2.4
 pytest>=8.0
+openrouteservice>=2.3
+python-dotenv>=1.0
