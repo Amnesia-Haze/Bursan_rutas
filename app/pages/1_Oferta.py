@@ -17,8 +17,13 @@ _DATA_DIR = os.path.join(_ROOT, "data")
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from core.instance import BursanInstance, Guard, load_instance, save_guardias
+from core.instance import BursanInstance, Guard, save_guardias
 from core.validator import validate_new_guard
+
+_APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # app/
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
+from state import get_instance, recargar_instancia
 
 # ---------------------------------------------------------------------------
 # Constantes de presentacion
@@ -88,8 +93,7 @@ st.markdown(f"""
 # Session state
 # ---------------------------------------------------------------------------
 def _init_ss() -> None:
-    if "inst" not in st.session_state:
-        st.session_state.inst = load_instance(_DATA_DIR)
+    get_instance(_DATA_DIR)   # carga inst en session_state si no existe aún
     if "confirm_mass" not in st.session_state:
         st.session_state.confirm_mass = False
     if "ng_calc_dists" not in st.session_state:
@@ -278,7 +282,8 @@ def _render_tabla(inst: BursanInstance) -> None:
                 if g:
                     g.estado = nuevo
             _save_inst(inst)
-            st.success(f"✅ {len(changes)} guardia(s) actualizados.")
+            recargar_instancia(_DATA_DIR)
+            st.success("✓ Cambio guardado. La instancia se actualizó.")
             st.rerun()
 
 
@@ -376,6 +381,7 @@ def _render_agregar(inst: BursanInstance) -> None:
             inst.distancias[guard_data["id"]] = dist_vals
             _save_inst(inst)
             _append_distancias_csv(inst, guard_data["id"], dist_vals)
+            recargar_instancia(_DATA_DIR)
 
             # Limpiar campos del formulario
             for k in ["ng_id", "ng_nombre", "ng_dir"]:
@@ -384,7 +390,7 @@ def _render_agregar(inst: BursanInstance) -> None:
                 st.session_state.pop(f"ng_dist_{e.nombre}", None)
             st.session_state.ng_calc_dists = {}
 
-            st.success(f"✅ Guardia **{guard_data['id']}** registrado correctamente.")
+            st.success("✓ Cambio guardado. La instancia se actualizó.")
             st.rerun()
 
 
@@ -445,8 +451,9 @@ def _render_masivo(inst: BursanInstance) -> None:
                         g.estado = pestado
                         updated += 1
                 _save_inst(inst)
+                recargar_instancia(_DATA_DIR)
                 st.session_state.confirm_mass = False
-                st.success(f"✅ {updated} guardia(s) actualizados a '{pestado}'.")
+                st.success("✓ Cambio guardado. La instancia se actualizó.")
                 st.rerun()
         with col_cancel:
             if st.button("❌ Cancelar", key="mass_cancel"):
@@ -458,7 +465,7 @@ def _render_masivo(inst: BursanInstance) -> None:
 # Layout principal
 # ---------------------------------------------------------------------------
 _init_ss()
-inst: BursanInstance = st.session_state.inst
+inst: BursanInstance = get_instance(_DATA_DIR)
 
 st.title("👮 Gestión de Guardias — Oferta Operacional")
 _render_metricas(inst)

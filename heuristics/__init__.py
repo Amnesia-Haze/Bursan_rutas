@@ -42,6 +42,7 @@ class RoutingResult:
     n_buses_necesarios: int
     guardias_exclusivos: list[str]  # guardias que requirieron ruta exclusiva
     metodo: str
+    metodo_distancia: str = "haversine_fallback"  # "ors_road" | "ors_road_cached" | "haversine_fallback"
 
 
 # ---------------------------------------------------------------------------

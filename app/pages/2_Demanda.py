@@ -18,8 +18,13 @@ _DATA_DIR = os.path.join(_ROOT, "data")
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from core.instance import BursanInstance, Company, load_instance
+from core.instance import BursanInstance, Company
 from core.validator import validate_new_company
+
+_APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # app/
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
+from state import get_instance, recargar_instancia
 
 # ---------------------------------------------------------------------------
 # Constantes
@@ -71,8 +76,7 @@ st.markdown(f"""
 # Session state
 # ---------------------------------------------------------------------------
 def _init_ss() -> None:
-    if "inst" not in st.session_state:
-        st.session_state.inst = load_instance(_DATA_DIR)
+    get_instance(_DATA_DIR)   # carga inst en session_state si no existe aún
     if "demand_adj" not in st.session_state:
         st.session_state.demand_adj = {}       # {empresa_nombre: int} ajuste temporal
     if "confirm_inactivar" not in st.session_state:
@@ -296,8 +300,8 @@ def _render_tabla(inst: BursanInstance) -> None:
                     st.error(err)
             else:
                 _save_empresas(inst)
-                n_emps = len(cambios)
-                st.success(f"✅ {n_emps} empresa(s) actualizada(s).")
+                recargar_instancia(_DATA_DIR)
+                st.success("✓ Cambio guardado. La instancia se actualizó.")
                 st.rerun()
 
 
@@ -457,6 +461,7 @@ def _render_agregar(inst: BursanInstance) -> None:
         )
         inst.empresas.append(new_emp)
         _save_empresas(inst)
+        recargar_instancia(_DATA_DIR)
 
         # No agregar filas a distancias.csv — distancias faltantes se detectan en validación
         for k in ["ne_nombre", "ne_dir"]:
@@ -510,8 +515,9 @@ def _render_inactivar(inst: BursanInstance) -> None:
                 if st.button("✅ Confirmar baja", type="primary", key="btn_inactivar_ok"):
                     emp_pendiente.estado_contrato = "inactivo"
                     _save_empresas(inst)
+                    recargar_instancia(_DATA_DIR)
                     st.session_state.confirm_inactivar = False
-                    st.success(f"Contrato de **{nombre_pendiente}** marcado como inactivo.")
+                    st.success("✓ Cambio guardado. La instancia se actualizó.")
                     st.rerun()
             with col_cancel:
                 if st.button("❌ Cancelar", key="btn_inactivar_cancel"):
@@ -531,7 +537,8 @@ def _render_inactivar(inst: BursanInstance) -> None:
                 if st.button("Reactivar", key=f"react_{e.nombre}"):
                     e.estado_contrato = "activo"
                     _save_empresas(inst)
-                    st.success(f"Contrato de {e.nombre} reactivado.")
+                    recargar_instancia(_DATA_DIR)
+                    st.success("✓ Cambio guardado. La instancia se actualizó.")
                     st.rerun()
 
 
@@ -539,7 +546,7 @@ def _render_inactivar(inst: BursanInstance) -> None:
 # Layout principal
 # ---------------------------------------------------------------------------
 _init_ss()
-inst: BursanInstance = st.session_state.inst
+inst: BursanInstance = get_instance(_DATA_DIR)
 adj: dict[str, int]  = st.session_state.demand_adj
 
 _render_balance(inst, adj)

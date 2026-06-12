@@ -1,6 +1,7 @@
 """core/assignment.py — Resolución del problema de asignación guardias-empresas con PuLP."""
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -280,6 +281,107 @@ def _resultado_vacio(
 
 
 # ---------------------------------------------------------------------------
+# Diagnóstico de infactibilidad
+# ---------------------------------------------------------------------------
+
+def diagnosticar_infactibilidad(
+    inst: BursanInstance,
+    modo: str,
+    alpha: float,
+    beta: float,
+    d_max: float,
+    delta_equidad: float | None,
+    tiempo_limite: int = 30,
+) -> list[str]:
+    """
+    Cuando resolver_asignacion() retorna Infeasible, identifica causas
+    probables re-resolviendo con relajaciones incrementales.
+    Retorna lista de mensajes ordenados de más a menos probable,
+    cada uno con una acción concreta sugerida.
+    """
+    causas: list[str] = []
+
+    guardias = inst.guardias_activos()
+    empresas = [e for e in inst.empresas if e.is_activa()]
+    n_activos = len(guardias)
+    demanda_total = sum(e.demanda_total() for e in empresas)
+
+    # 1) Suficiencia bruta de guardias — causa raíz más común
+    if n_activos < demanda_total:
+        faltan = demanda_total - n_activos
+        causas.append(
+            f"🔴 **Guardias insuficientes**: hay {n_activos} activos pero se "
+            f"requieren {demanda_total} puestos. Activa al menos {faltan} "
+            f"guardia(s) más, o reduce la demanda en Empresas."
+        )
+        return causas  # causa raíz clara — no seguir diagnosticando
+
+    # 2) Supervisor disponible para empresas que lo requieren
+    supervisores = [g for g in guardias if g.supervisor]
+    for e in empresas:
+        if e.requiere_supervisor and e.demanda_total() > 0 and not supervisores:
+            causas.append(
+                f"🔴 **{e.nombre} requiere supervisor certificado** pero no "
+                f"hay ningún supervisor activo. Reactiva a G1 o G6, o marca "
+                f"a otro guardia como supervisor."
+            )
+
+    # 3) Relajar restricción de equidad
+    if delta_equidad is not None:
+        r = resolver_asignacion(inst, modo=modo, alpha=alpha, beta=beta,
+                                d_max=d_max, delta_equidad=None,
+                                tiempo_limite=tiempo_limite)
+        if r.status == "Optimal":
+            causas.append(
+                f"🟠 **Δ_max = {delta_equidad:.0f} km es demasiado estricto**. "
+                f"Sin esa restricción, el rango real mínimo alcanzable es "
+                f"≈ {r.z_range:.1f} km. Aumenta Δ_max a al menos "
+                f"{math.ceil(r.z_range)} km, o desactiva la equidad."
+            )
+
+    # 4) Relajar D_max
+    r2 = resolver_asignacion(inst, modo=modo, alpha=alpha, beta=beta,
+                             d_max=9999, delta_equidad=delta_equidad,
+                             tiempo_limite=tiempo_limite)
+    if r2.status == "Optimal":
+        causas.append(
+            f"🟠 **D_max = {d_max:.0f} km es demasiado restrictivo**. "
+            f"Con la asignación óptima se requiere al menos "
+            f"{math.ceil(r2.z_max)} km para algún guardia. "
+            f"Aumenta D_max a {math.ceil(r2.z_max)} km o más."
+        )
+
+    if not causas:
+        causas.append(
+            "🔴 **Restricciones incompatibles entre sí**. Prueba relajar "
+            "Δ_max y D_max simultáneamente, o revisa que todos los "
+            "guardias/empresas nuevos tengan distancias registradas."
+        )
+
+    return causas
+
+
+# ---------------------------------------------------------------------------
+# Línea base de comparación
+# ---------------------------------------------------------------------------
+
+def calcular_linea_base(inst: BursanInstance) -> AssignmentResult:
+    """
+    Recalcula la asignación 'línea base': suma total, sin restricciones
+    de equidad ni D_max adicional (D_max=9999), usando la matriz de
+    distancias ACTUAL de la instancia.
+
+    Sirve como referencia de comparación para cualquier modo que el
+    usuario haya seleccionado, calculada con los MISMOS datos que el
+    modelo está usando en este momento.
+    """
+    return resolver_asignacion(
+        inst, modo="suma_total", alpha=1.0, beta=0.0,
+        d_max=9999, delta_equidad=None, tiempo_limite=30,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Prueba mínima
 # ---------------------------------------------------------------------------
 
@@ -328,4 +430,20 @@ if __name__ == "__main__":
         assert res_eq.z_range <= 30.0 + 1e-4, f"Rango {res_eq.z_range} > delta_equidad 30.0"
         print(f"equidad30:  Z* = {res_eq.z_total:.1f} km  rango = {res_eq.z_range:.1f} km")
 
+    # --- Diagnóstico D_max muy bajo ---
+    r_inf = resolver_asignacion(inst, modo="suma_total", d_max=2.0, delta_equidad=None)
+    assert r_inf.status == "Infeasible", f"Esperado Infeasible, got {r_inf.status}"
+    causas = diagnosticar_infactibilidad(inst, "suma_total", 1.0, 0.0, 2.0, None)
+    assert any("D_max" in c for c in causas), causas
+    print("Diagnostico D_max bajo: OK —", causas[0][2:60].encode("ascii", "replace").decode())
+
+    # --- Diagnóstico equidad muy estricta ---
+    r_eq = resolver_asignacion(inst, modo="suma_total", d_max=40, delta_equidad=1.0)
+    if r_eq.status == "Infeasible":
+        causas2 = diagnosticar_infactibilidad(inst, "suma_total", 1.0, 0.0, 40, 1.0)
+        assert any("Δ_max" in c or "equidad" in c.lower() for c in causas2), causas2
+        print("Diagnostico equidad estricta: OK —",
+              causas2[0][2:60].encode("ascii", "replace").decode())
+
+    print("diagnosticar_infactibilidad OK")
     print("OK assignment.py: todas las aserciones pasaron")

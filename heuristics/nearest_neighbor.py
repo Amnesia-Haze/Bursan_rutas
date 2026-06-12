@@ -20,6 +20,8 @@ def nearest_neighbor_routing(
     asignacion: list[dict],
     coords: dict[str, tuple[float, float]] | None = None,
     seed: int = 42,
+    dist_matrix: dict[str, dict[str, float]] | None = None,
+    metodo_distancia: str = "haversine_fallback",
 ) -> RoutingResult:
     """
     Construye rutas de bus usando la heurística de vecino más cercano.
@@ -46,7 +48,9 @@ def nearest_neighbor_routing(
     random.seed(seed)
 
     all_stops = _gather_stops(inst, asignacion, coords)
-    dist_matrix = construir_matriz_distancias(list(all_stops.values()))
+    if dist_matrix is None:
+        dist_matrix = construir_matriz_distancias(list(all_stops.values()))
+        metodo_distancia = "haversine_fallback"
 
     valid = [
         a for a in asignacion
@@ -72,6 +76,7 @@ def nearest_neighbor_routing(
         n_buses_necesarios=len(all_routes),
         guardias_exclusivos=all_exclusivos,
         metodo="nearest_neighbor",
+        metodo_distancia=metodo_distancia,
     )
 
 

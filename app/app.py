@@ -19,7 +19,8 @@ _DATA_DIR = os.path.join(_ROOT, "data")
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from core.instance import BursanInstance, load_instance
+from core.instance import BursanInstance
+from state import get_instance, recargar_instancia
 
 
 # ---------------------------------------------------------------------------
@@ -129,19 +130,11 @@ _inject_css()
 
 
 # ---------------------------------------------------------------------------
-# Carga de instancia (una vez por sesión)
+# Carga de instancia (una vez por sesión, gestionada por state.py)
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner=False)
-def _cargar_instancia(data_dir: str) -> BursanInstance:
-    return load_instance(data_dir)
-
-
-if "inst" not in st.session_state:
-    with st.spinner("🔄 Cargando datos de Bursan..."):
-        st.session_state["inst"] = _cargar_instancia(_DATA_DIR)
-
-inst: BursanInstance = st.session_state["inst"]
+with st.spinner("🔄 Cargando datos de Bursan..."):
+    inst = get_instance(_DATA_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +205,13 @@ with st.sidebar:
     )
 
     st.markdown('<hr style="border-color:#2c5282;margin:8px 0 0">', unsafe_allow_html=True)
+
+    # Recarga manual de datos
+    if st.button("🔄 Recargar datos", help="Usar después de modificar guardias o empresas",
+                 use_container_width=True):
+        recargar_instancia(_DATA_DIR)
+        st.rerun()
+    st.caption(f"Datos cargados: {st.session_state.get('instance_loaded_at', '—')}")
 
     # Versión / build info
     st.markdown(

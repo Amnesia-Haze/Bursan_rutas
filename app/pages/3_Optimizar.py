@@ -14,15 +14,20 @@ import streamlit as st
 import os
 import sys
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(os.path.dirname(_HERE))   # bursan_rutas/
+_HERE    = os.path.dirname(os.path.abspath(__file__))
+_ROOT    = os.path.dirname(os.path.dirname(_HERE))   # bursan_rutas/
+_APP_DIR = os.path.dirname(_HERE)                     # app/
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
 
 from core.instance import BursanInstance
-from core.assignment import resolver_asignacion, AssignmentResult
+from core.assignment import resolver_asignacion, AssignmentResult, calcular_linea_base
+from core.distances import get_route_geometry
 from core.routing import resolver_rutas, COORDS_FALLBACK
 from heuristics import RoutingResult
+from state import get_instance, recargar_instancia
 
 try:
     import folium
@@ -45,10 +50,6 @@ _ROUTE_COLORS = [
     "#9b59b6", "#1abc9c", "#e67e22", "#34495e",
 ]
 
-_FASE1_REF = {
-    "z_total_km": 151.1,
-    "nota": "Referencia del informe Bursan Fase 1 — ILP con distancias geocodificadas reales.",
-}
 
 _MODO_LABELS: dict[str, str] = {
     "suma_total":    "Minimizar distancia total",
@@ -351,17 +352,24 @@ def _build_map(
     if routing:
         for i, ruta in enumerate(routing.rutas):
             color = _ROUTE_COLORS[i % len(_ROUTE_COLORS)]
-            coords = [
-                [s.lat, s.lon]
+            waypoints = [
+                (s.lat, s.lon)
                 for s in ruta.paradas
                 if s.lat is not None and s.lon is not None
             ]
-            if len(coords) < 2:
+            if len(waypoints) < 2:
                 continue
+
+            # Geometría real por carretera; None → líneas rectas como fallback
+            geometria = get_route_geometry(waypoints)
+            polyline_coords = geometria if geometria is not None else waypoints
+
             cos = sorted({s.node_id for s in ruta.paradas if s.node_type == "empresa"})
             line = _folium.PolyLine(
-                coords, color=color, weight=4, opacity=0.85,
-                tooltip=f"Bus {i+1}: {', '.join(ruta.guardias)} → {', '.join(cos)}",
+                locations=polyline_coords,
+                color=color, weight=4, opacity=0.8,
+                tooltip=f"Bus {i+1}: {', '.join(ruta.guardias)} → {', '.join(cos)}"
+                        f" — {ruta.distancia_total_km:.1f} km",
             )
             line.add_to(m)
             try:
@@ -371,6 +379,19 @@ def _build_map(
                 ).add_to(m)
             except Exception:
                 pass
+
+        # Advertencia si no hay geometría real de carretera
+        if getattr(routing, "metodo_distancia", "haversine_fallback") == "haversine_fallback":
+            _folium.Marker(
+                location=[inst.deposito_lat + 0.02, inst.deposito_lon],
+                popup=_folium.Popup(
+                    "Rutas en linea recta — configura ORS_API_KEY para "
+                    "trazado real por carretera",
+                    max_width=300,
+                ),
+                icon=_folium.Icon(color="orange", icon="warning-sign", prefix="glyphicon"),
+                tooltip="Aviso: rutas en linea recta",
+            ).add_to(m)
 
     return m
 
@@ -478,12 +499,25 @@ def _render_asignacion(
     inst: BursanInstance,
     asignacion: AssignmentResult,
     routing: RoutingResult | None,
+    params: dict,
 ) -> None:
-    if asignacion.status != "Optimal":
-        st.error(
-            f"El modelo ILP no encontro solucion factible (status: **{asignacion.status}**). "
-            "Prueba aumentar D_max o desactivar la restriccion de equidad."
+    if asignacion.status == "Infeasible":
+        st.error("❌ El modelo no encontró una solución factible con la "
+                 "configuración actual.")
+        from core.assignment import diagnosticar_infactibilidad
+        causas = diagnosticar_infactibilidad(
+            inst,
+            modo=params["modo"],
+            alpha=params["alpha"],
+            beta=params["beta"],
+            d_max=params["d_max"],
+            delta_equidad=params.get("delta_equidad"),
         )
+        for causa in causas:
+            st.markdown(causa)
+        return
+    if asignacion.status != "Optimal":
+        st.error(f"El modelo retornó status inesperado: **{asignacion.status}**.")
         return
 
     n_activos  = len(inst.guardias_activos())
@@ -513,16 +547,31 @@ def _render_asignacion(
     st.dataframe(_asign_df(asignacion, inst), use_container_width=True, hide_index=True)
     st.plotly_chart(_bar_asignacion(asignacion), use_container_width=True)
 
-    with st.expander("Comparar con Fase 1 (referencia)"):
-        c1, c2 = st.columns(2)
-        c1.metric("Fase 1 — Z* total", f"{_FASE1_REF['z_total_km']:.1f} km")
-        c2.metric(
-            "Nuestro modelo — Z* total",
-            f"{asignacion.z_total:.1f} km",
-            delta=f"{asignacion.z_total - _FASE1_REF['z_total_km']:.1f} km",
-            delta_color="inverse",
+    with st.expander("📊 Comparar con línea base (suma total, sin restricciones extra)"):
+        linea_base = calcular_linea_base(inst)
+        modo_label = _MODO_LABELS.get(params["modo"], params["modo"])
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Línea base**")
+            st.metric("Distancia total",  f"{linea_base.z_total:.1f} km")
+            st.metric("Distancia máxima", f"{linea_base.z_max:.1f} km")
+            st.metric("Rango (equidad)",  f"{linea_base.z_range:.1f} km")
+        with col2:
+            delta_total = asignacion.z_total - linea_base.z_total
+            delta_max   = asignacion.z_max   - linea_base.z_max
+            delta_range = asignacion.z_range - linea_base.z_range
+            st.markdown(f"**Configuración actual ({modo_label})**")
+            st.metric("Distancia total",  f"{asignacion.z_total:.1f} km",
+                      delta=f"{delta_total:+.1f} km")
+            st.metric("Distancia máxima", f"{asignacion.z_max:.1f} km",
+                      delta=f"{delta_max:+.1f} km", delta_color="inverse")
+            st.metric("Rango (equidad)",  f"{asignacion.z_range:.1f} km",
+                      delta=f"{delta_range:+.1f} km", delta_color="inverse")
+        st.caption(
+            "La línea base se recalcula con la matriz de distancias actual "
+            "de la instancia (puede diferir del informe Fase 1 original, "
+            "que reportó 151,1 km con una matriz de distancias en papel)."
         )
-        st.caption(_FASE1_REF["nota"])
 
 
 def _render_rutas(routing: RoutingResult | None) -> None:
@@ -566,7 +615,8 @@ def _render_mapa(
         )
         return
 
-    m = _build_map(inst, asignacion, routing)
+    with st.spinner("Generando mapa con rutas reales..."):
+        m = _build_map(inst, asignacion, routing)
     st_folium(m, width="100%", height=520, returned_objects=[])
 
     lc = st.columns(4)
@@ -631,9 +681,11 @@ def _render_sensibilidad(inst: BursanInstance, base_params: dict) -> None:
                 p["beta"] = round(1.0 - float(val), 2)
             try:
                 inst_tmp = deepcopy(inst)
-                inst_tmp.capacidad_bus        = p["capacidad_bus"]
-                inst_tmp.max_distancia_ruta   = p["r_ruta"]
-                inst_tmp.max_distancia_vecino = p["r_vecino"]
+                inst_tmp.capacidad_bus          = p["capacidad_bus"]
+                inst_tmp.max_distancia_ruta     = p["r_ruta"]
+                inst_tmp.max_distancia_vecino   = p["r_vecino"]
+                inst_tmp.rendimiento_kmL        = p["rendimiento"]
+                inst_tmp.precio_combustible_clp = p["precio_comb"]
                 a = resolver_asignacion(
                     inst_tmp,
                     modo          = p["modo"],
@@ -753,11 +805,19 @@ st.set_page_config(
 _inject_css()
 _init_state()
 
-if "inst" not in st.session_state or st.session_state.inst is None:
-    st.warning("Instancia no cargada. Ve a la pagina de inicio (Home) para cargarla.")
-    st.stop()
+inst = get_instance()  # carga automáticamente si no existe en session_state
 
-inst: BursanInstance = st.session_state.inst
+n_activos     = len(inst.guardias_activos())
+demanda_total = sum(e.demanda_total() for e in inst.empresas if e.is_activa())
+balance       = n_activos - demanda_total
+col_a, col_b, col_c = st.columns(3)
+col_a.metric("Guardias activos", n_activos)
+col_b.metric("Demanda total",    demanda_total)
+col_c.metric("Balance",          f"{balance:+d}", delta_color="off")
+
+if st.session_state.get("instance_needs_reload", False):
+    st.warning("⚠️ Hay cambios sin sincronizar. Presiona '🔄 Recargar datos' "
+               "en el menú lateral antes de optimizar.")
 
 params, do_optimize = _render_sidebar()
 
@@ -794,7 +854,7 @@ _PLACEHOLDER = "Haz click en **🚀 OPTIMIZAR** para generar resultados."
 
 with tab1:
     if result:
-        _render_asignacion(result["inst_opt"], result["asignacion"], result["routing"])
+        _render_asignacion(result["inst_opt"], result["asignacion"], result["routing"], params)
         st.markdown("---")
         st.download_button(
             "📦 Exportar resultados (ZIP — asignacion.csv + rutas.csv + reporte.html)",

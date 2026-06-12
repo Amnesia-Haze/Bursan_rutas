@@ -7,6 +7,7 @@ import warnings
 try:
     from core.instance import BursanInstance, Guard
     from core.assignment import AssignmentResult
+    from core.distances import get_distance_matrix
     from heuristics import RoutingResult, Stop, construir_matriz_distancias
     from heuristics.nearest_neighbor import nearest_neighbor_routing
     from heuristics.clarke_wright import clarke_wright_routing
@@ -16,6 +17,7 @@ except ModuleNotFoundError:
     _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
     from core.instance import BursanInstance, Guard
     from core.assignment import AssignmentResult
+    from core.distances import get_distance_matrix
     from heuristics import RoutingResult, Stop, construir_matriz_distancias
     from heuristics.nearest_neighbor import nearest_neighbor_routing
     from heuristics.clarke_wright import clarke_wright_routing
@@ -27,7 +29,7 @@ _METODOS_VALIDOS = frozenset({"nearest_neighbor", "clarke_wright"})
 # Aproximaciones para la Region del Biobio — usar solo si geopy falla
 COORDS_FALLBACK: dict[str, tuple[float, float]] = {
     # Guardias — domicilios aproximados por comuna
-    "G1":  (-36.601, -72.959),  # Talcahuano
+    "G1":  (-36.722, -73.114),  # Los Cerros, Talcahuano
     "G2":  (-37.027, -73.134),  # Coronel
     "G3":  (-36.827, -73.066),  # Collao, Concepcion
     "G4":  (-36.924, -72.992),  # Chiguayante
@@ -96,15 +98,26 @@ def resolver_rutas(
     # Resolver coordenadas para guardias sin lat/lon en la instancia
     coords = _build_coords(inst, asignacion.asignaciones)
 
+    # Construir la matriz de distancias UNA SOLA VEZ (ORS o haversine fallback)
+    dist_matrix, metodo_dist = _build_ors_matrix(inst, asignacion.asignaciones, coords)
+
     # Llamar al heuristico seleccionado
     if metodo == "clarke_wright":
-        result = clarke_wright_routing(inst, asignacion.asignaciones, coords=coords, seed=seed)
+        result = clarke_wright_routing(
+            inst, asignacion.asignaciones,
+            coords=coords, seed=seed,
+            dist_matrix=dist_matrix, metodo_distancia=metodo_dist,
+        )
     else:
-        result = nearest_neighbor_routing(inst, asignacion.asignaciones, coords=coords, seed=seed)
+        result = nearest_neighbor_routing(
+            inst, asignacion.asignaciones,
+            coords=coords, seed=seed,
+            dist_matrix=dist_matrix, metodo_distancia=metodo_dist,
+        )
 
-    # Aplicar 2-opt si se solicita
+    # Aplicar 2-opt si se solicita (reutiliza la misma matriz)
     if mejorar_2opt and result.rutas:
-        result = _apply_2opt(result, inst)
+        result = _apply_2opt(result, inst, dist_matrix=dist_matrix)
 
     return result
 
@@ -239,15 +252,76 @@ def _build_coords(
     return coords
 
 
-def _apply_2opt(result: RoutingResult, inst: BursanInstance) -> RoutingResult:
-    """Aplica mejora 2-opt a todas las rutas de un RoutingResult."""
-    # Recopilar todos los stops unicos de todas las rutas para la matriz de distancias
-    all_stops: dict[str, Stop] = {}
-    for r in result.rutas:
-        for s in r.paradas:
-            all_stops[s.node_id] = s
+def _build_ors_matrix(
+    inst: BursanInstance,
+    assignments: list[dict],
+    coords_override: dict[str, tuple[float, float]],
+) -> tuple[dict[str, dict[str, float]], str]:
+    """
+    Construye la matriz de distancias para todos los nodos del problema
+    en UNA SOLA llamada a get_distance_matrix() (ORS o haversine fallback).
 
-    dist_matrix = construir_matriz_distancias(list(all_stops.values()))
+    Retorna (dist_dict, metodo).  dist_dict es {node_id: {node_id: km}}.
+    """
+    guard_map   = {g.id: g   for g in inst.guardias}
+    empresa_map = {e.nombre: e for e in inst.empresas}
+
+    # Recopilar nodos únicos en orden estable
+    node_ids: list[str] = ["deposito"]
+    seen: set[str] = {"deposito"}
+    for a in assignments:
+        for nid in (a["guardia_id"], a["empresa"]):
+            if nid not in seen:
+                node_ids.append(nid)
+                seen.add(nid)
+
+    def _resolve(nid: str) -> tuple[float, float] | None:
+        if nid == "deposito":
+            return (inst.deposito_lat, inst.deposito_lon)
+        if nid in coords_override:
+            return coords_override[nid]
+        entity = guard_map.get(nid) or empresa_map.get(nid)
+        if entity:
+            lat = getattr(entity, "lat", None)
+            lon = getattr(entity, "lon", None)
+            if lat is not None and lon is not None:
+                return (lat, lon)
+        if nid in COORDS_FALLBACK:
+            return COORDS_FALLBACK[nid]
+        return None
+
+    valid_ids: list[str] = []
+    node_coords: list[tuple[float, float]] = []
+    for nid in node_ids:
+        c = _resolve(nid)
+        if c is not None:
+            valid_ids.append(nid)
+            node_coords.append(c)
+
+    if not node_coords:
+        return {}, "haversine_fallback"
+
+    km_matrix, _, metodo = get_distance_matrix(node_coords)
+
+    dist_dict: dict[str, dict[str, float]] = {
+        valid_ids[i]: {valid_ids[j]: km_matrix[i][j] for j in range(len(valid_ids))}
+        for i in range(len(valid_ids))
+    }
+    return dist_dict, metodo
+
+
+def _apply_2opt(
+    result: RoutingResult,
+    inst: BursanInstance,
+    dist_matrix: dict[str, dict[str, float]] | None = None,
+) -> RoutingResult:
+    """Aplica mejora 2-opt a todas las rutas de un RoutingResult."""
+    if dist_matrix is None:
+        all_stops: dict[str, Stop] = {}
+        for r in result.rutas:
+            for s in r.paradas:
+                all_stops[s.node_id] = s
+        dist_matrix = construir_matriz_distancias(list(all_stops.values()))
 
     improved = [
         improve_route_2opt(
@@ -259,8 +333,8 @@ def _apply_2opt(result: RoutingResult, inst: BursanInstance) -> RoutingResult:
         for r in result.rutas
     ]
 
-    dist_total = round(sum(r.distancia_total_km for r in improved), 2)
-    costo_total = round(sum(r.costo_clp for r in improved), 2)
+    dist_total  = round(sum(r.distancia_total_km for r in improved), 2)
+    costo_total = round(sum(r.costo_clp         for r in improved), 2)
 
     return RoutingResult(
         rutas=improved,
@@ -269,6 +343,7 @@ def _apply_2opt(result: RoutingResult, inst: BursanInstance) -> RoutingResult:
         n_buses_necesarios=len(improved),
         guardias_exclusivos=result.guardias_exclusivos,
         metodo=result.metodo,
+        metodo_distancia=result.metodo_distancia,
     )
 
 
@@ -280,6 +355,7 @@ def _empty_result(metodo: str) -> RoutingResult:
         n_buses_necesarios=0,
         guardias_exclusivos=[],
         metodo=metodo,
+        metodo_distancia="haversine_fallback",
     )
 
 
@@ -335,10 +411,11 @@ if __name__ == "__main__":
     for r in res_nn.rutas:
         assert r.paradas[0].node_id == "deposito"
         assert r.paradas[-1].node_id == "deposito"
+    assert res_nn.metodo_distancia in {"ors_road", "ors_road_cached", "haversine_fallback"}
     print(
         f"NN+2opt : {len(res_nn.rutas)} ruta(s), "
         f"{res_nn.distancia_total_sistema:.1f} km, "
-        f"${res_nn.costo_total_clp:,.0f} CLP"
+        f"${res_nn.costo_total_clp:,.0f} CLP  [{res_nn.metodo_distancia}]"
     )
 
     # --- clarke_wright + 2-opt ---
@@ -346,10 +423,11 @@ if __name__ == "__main__":
     assert len(res_cw.rutas) >= 1, "CW: debe haber al menos una ruta"
     assert res_cw.distancia_total_sistema > 0
     assert sorted(g for r in res_cw.rutas for g in r.guardias) == ["TG1", "TG2", "TG3", "TG4"]
+    assert res_cw.metodo_distancia in {"ors_road", "ors_road_cached", "haversine_fallback"}
     print(
         f"CW+2opt : {len(res_cw.rutas)} ruta(s), "
         f"{res_cw.distancia_total_sistema:.1f} km, "
-        f"${res_cw.costo_total_clp:,.0f} CLP"
+        f"${res_cw.costo_total_clp:,.0f} CLP  [{res_cw.metodo_distancia}]"
     )
 
     # --- Asignacion vacia → resultado vacio valido ---
