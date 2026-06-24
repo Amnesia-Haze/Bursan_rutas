@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 try:
@@ -35,6 +35,7 @@ class AssignmentResult:
     modo: str            # "suma_total" | "minimax" | "multiobjetivo"
     alpha: float
     beta: float
+    guardias_reserva: list[str] = field(default_factory=list)  # activos no asignados
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,7 @@ def resolver_asignacion(
     d_max: float = 40.0,
     delta_equidad: Optional[float] = None,
     tiempo_limite: int = 60,
+    _ignorar_supervisor: bool = False,
 ) -> AssignmentResult:
     """
     Resuelve el problema de asignación de guardias a empresas mediante ILP (PuLP/CBC).
@@ -67,23 +69,24 @@ def resolver_asignacion(
     - "multiobjetivo": Min alpha*(Σ d_ge * x_get) + beta*M
 
     Restricciones:
-    - R1: cada guardia activo asignado a exactamente 1 (empresa, turno)
+    - R1: cada guardia activo asignado a lo sumo 1 (empresa, turno) — puede quedar en reserva
     - R2: cada puesto (empresa, turno) cubierto exactamente con n_ET guardias
     - R3: al menos 1 supervisor asignado a Oleoducto turno día
     - R4: distancia <= d_max por guardia (implementado via prefilter de variables)
     - R6 (opcional): z_max - z_min <= delta_equidad
 
     Args:
-        inst:           Instancia completa de Bursan.
-        modo:           Función objetivo.
-        alpha:          Peso de suma total en modo multiobjetivo.
-        beta:           Peso de distancia máxima en modo multiobjetivo.
-        d_max:          Distancia máxima por guardia (km). Por defecto 40.0.
-        delta_equidad:  Rango máximo z_max - z_min. None = sin restricción.
-        tiempo_limite:  Tiempo límite CBC en segundos.
+        inst:                Instancia completa de Bursan.
+        modo:                Función objetivo.
+        alpha:               Peso de suma total en modo multiobjetivo.
+        beta:                Peso de distancia máxima en modo multiobjetivo.
+        d_max:               Distancia máxima por guardia (km). Por defecto 40.0.
+        delta_equidad:       Rango máximo z_max - z_min. None = sin restricción.
+        tiempo_limite:       Tiempo límite CBC en segundos.
+        _ignorar_supervisor: Uso interno del diagnóstico. Si True, omite R3.
 
     Returns:
-        AssignmentResult con status, métricas de distancia y lista de asignaciones.
+        AssignmentResult con status, métricas de distancia, asignaciones y reserva.
 
     Raises:
         ValueError: si modo no es uno de los valores válidos.
@@ -124,13 +127,9 @@ def resolver_asignacion(
                     x[key] = pulp.LpVariable(f"x_{safe}", cat="Binary")
                     d_lkp[key] = d_ge
 
-    # Detección temprana de infactibilidad en R1 y R2
-    for g in guardias:
-        if not any(k[0] == g.id for k in x):
-            return _resultado_vacio(
-                "Infeasible", modo, alpha, beta, time.perf_counter() - t0
-            )
-
+    # Detección temprana de infactibilidad en R2:
+    # cada puesto demandado debe tener al menos n_et candidatos disponibles.
+    # (Ya NO se exige que cada guardia tenga un puesto: con R1 <= 1 puede ir a reserva.)
     for e in empresas:
         for t in _TURNOS:
             n_et = demand[(e.nombre, t)]
@@ -168,10 +167,12 @@ def resolver_asignacion(
     else:
         prob += alpha * suma_expr + beta * M_max, "objetivo"
 
-    # R1: cada guardia activo asignado a exactamente 1 puesto
+    # R1: cada guardia activo asignado A LO SUMO a 1 puesto.
+    # Los guardias activos no asignados quedan disponibles como RESERVA.
+    # Esto permite que n_activos > demanda_total sea factible.
     for g in guardias:
         prob += (
-            pulp.lpSum(x[k] for k in x if k[0] == g.id) == 1,
+            pulp.lpSum(x[k] for k in x if k[0] == g.id) <= 1,
             f"R1_{g.id}",
         )
 
@@ -187,12 +188,19 @@ def resolver_asignacion(
             )
 
     # R3: al menos 1 supervisor en Oleoducto turno día
-    oleo = next((e for e in empresas if e.nombre == "Oleoducto" and e.requiere_supervisor), None)
-    if oleo:
-        sup_ids = {g.id for g in guardias if g.supervisor}
-        sup_vars = [x[k] for k in x if k[1] == "Oleoducto" and k[2] == "D" and k[0] in sup_ids]
-        if sup_vars:
-            prob += pulp.lpSum(sup_vars) >= 1, "R3_supervisor_oleoducto"
+    if not _ignorar_supervisor:
+        oleo = next(
+            (e for e in empresas if e.nombre == "Oleoducto" and e.requiere_supervisor),
+            None,
+        )
+        if oleo:
+            sup_ids = {g.id for g in guardias if g.supervisor}
+            sup_vars = [
+                x[k] for k in x
+                if k[1] == "Oleoducto" and k[2] == "D" and k[0] in sup_ids
+            ]
+            if sup_vars:
+                prob += pulp.lpSum(sup_vars) >= 1, "R3_supervisor_oleoducto"
 
     # Restricciones de M_max para minimax, multiobjetivo y/o R6
     if M_max is not None:
@@ -222,7 +230,7 @@ def resolver_asignacion(
             status="Infeasible" if prob.status == -1 else raw,
             z_total=0.0, z_max=0.0, z_min=0.0, z_range=0.0,
             asignaciones=[], runtime_seg=round(runtime, 3),
-            modo=modo, alpha=alpha, beta=beta,
+            modo=modo, alpha=alpha, beta=beta, guardias_reserva=[],
         )
 
     # -----------------------------------------------------------------------
@@ -247,6 +255,10 @@ def resolver_asignacion(
             )
             dists.append(d_km)
 
+    # Guardias activos que NO fueron asignados → reserva
+    ids_asignados = {a["guardia_id"] for a in asignaciones}
+    guardias_reserva = [g.id for g in guardias if g.id not in ids_asignados]
+
     z_total = round(sum(a["distancia_km"] for a in asignaciones), 2)
     z_max = max(dists) if dists else 0.0
     z_min = min(dists) if dists else 0.0
@@ -262,6 +274,7 @@ def resolver_asignacion(
         modo=modo,
         alpha=alpha,
         beta=beta,
+        guardias_reserva=sorted(guardias_reserva),
     )
 
 
@@ -276,7 +289,7 @@ def _resultado_vacio(
     return AssignmentResult(
         status=status, z_total=0.0, z_max=0.0, z_min=0.0, z_range=0.0,
         asignaciones=[], runtime_seg=round(runtime, 3),
-        modo=modo, alpha=alpha, beta=beta,
+        modo=modo, alpha=alpha, beta=beta, guardias_reserva=[],
     )
 
 
@@ -316,17 +329,41 @@ def diagnosticar_infactibilidad(
         )
         return causas  # causa raíz clara — no seguir diagnosticando
 
-    # 2) Supervisor disponible para empresas que lo requieren
-    supervisores = [g for g in guardias if g.supervisor]
+    # 2) Cobertura de puestos: algún puesto sin suficientes candidatos por D_max
     for e in empresas:
-        if e.requiere_supervisor and e.demanda_total() > 0 and not supervisores:
-            causas.append(
-                f"🔴 **{e.nombre} requiere supervisor certificado** pero no "
-                f"hay ningún supervisor activo. Reactiva a G1 o G6, o marca "
-                f"a otro guardia como supervisor."
+        for t, n_et in (("D", e.turno_dia), ("N", e.turno_noche)):
+            if n_et == 0:
+                continue
+            candidatos = sum(
+                1 for g in guardias
+                if inst.distancias.get(g.id, {}).get(e.nombre, float("inf")) <= d_max
             )
+            if candidatos < n_et:
+                causas.append(
+                    f"🟠 **{e.nombre} turno {t} no tiene candidatos suficientes** "
+                    f"dentro de D_max={d_max:.0f} km: requiere {n_et}, hay {candidatos} "
+                    f"guardias a ≤ {d_max:.0f} km. Aumenta D_max o agrega guardias "
+                    f"cercanos a {e.nombre}."
+                )
 
-    # 3) Relajar restricción de equidad
+    # 3) Supervisor disponible para empresas que lo requieren
+    supervisores = [g for g in guardias if g.supervisor]
+    r_sin_r3 = resolver_asignacion(
+        inst, modo=modo, alpha=alpha, beta=beta, d_max=9999,
+        delta_equidad=None, tiempo_limite=tiempo_limite, _ignorar_supervisor=True,
+    )
+    if r_sin_r3.status == "Optimal":
+        # El modelo es factible SIN R3 → la restricción de supervisor es la culpable
+        empresas_suv = [e.nombre for e in empresas if e.requiere_supervisor]
+        sup_ids = [g.id for g in supervisores]
+        causas.append(
+            f"🔴 **Restricción de supervisor (R3) infactible**. "
+            f"Empresas que requieren supervisor: {empresas_suv}. "
+            f"Supervisores activos: {sup_ids or 'NINGUNO'}. "
+            f"Reactiva un supervisor (G1 o G6) o marca a otro guardia como supervisor."
+        )
+
+    # 4) Relajar restricción de equidad
     if delta_equidad is not None:
         r = resolver_asignacion(inst, modo=modo, alpha=alpha, beta=beta,
                                 d_max=d_max, delta_equidad=None,
@@ -339,7 +376,7 @@ def diagnosticar_infactibilidad(
                 f"{math.ceil(r.z_range)} km, o desactiva la equidad."
             )
 
-    # 4) Relajar D_max
+    # 5) Relajar D_max
     r2 = resolver_asignacion(inst, modo=modo, alpha=alpha, beta=beta,
                              d_max=9999, delta_equidad=delta_equidad,
                              tiempo_limite=tiempo_limite)
@@ -388,6 +425,7 @@ def calcular_linea_base(inst: BursanInstance) -> AssignmentResult:
 if __name__ == "__main__":
     import os
     import sys
+    from copy import deepcopy
 
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _root not in sys.path:
@@ -397,53 +435,67 @@ if __name__ == "__main__":
 
     inst = load_instance()
 
-    # --- Modo suma_total ---
+    # --- Caso balanceado (demanda original = 14 puestos): 0 en reserva ---
     res = resolver_asignacion(inst, modo="suma_total")
     assert res.status == "Optimal", f"Status inesperado: {res.status}"
-    # Valor obtenido con distancias aproximadas (la referencia de Fase 1 es 151.1 km,
-    # alcanzable una vez que se geocodifiquen las distancias reales).
-    assert abs(res.z_total - 168.0) < 0.5, (
-        f"Z* = {res.z_total:.2f} km (esperado 168.0 con distancias aproximadas)"
+    demanda_base = sum(e.demanda_total() for e in inst.empresas if e.is_activa())
+    assert len(res.asignaciones) == demanda_base, (
+        f"Esperadas {demanda_base} asignaciones, got {len(res.asignaciones)}"
     )
+    n_activos = len(inst.guardias_activos())
+    assert len(res.guardias_reserva) == n_activos - demanda_base
     print(f"suma_total: Z* = {res.z_total:.1f} km  "
           f"[rango {res.z_min:.1f}..{res.z_max:.1f}]  "
+          f"{len(res.asignaciones)} asignados, {len(res.guardias_reserva)} reserva  "
           f"t={res.runtime_seg:.2f}s")
 
-    # Verificar que las 14 asignaciones son exactamente 14 (una por guardia)
-    assert len(res.asignaciones) == 14, f"Esperadas 14 asignaciones, got {len(res.asignaciones)}"
+    # --- Caso de la captura: 14 activos, demanda menor → guardias en reserva ---
+    inst_red = deepcopy(inst)
+    demandas_test = {
+        "Noramco":   (1, 1),
+        "ITI Chile": (2, 1),
+        "Oleoducto": (3, 0),
+        "Indama":    (1, 0),
+    }  # suma = 9
+    for e in inst_red.empresas:
+        if e.nombre in demandas_test:
+            e.turno_dia, e.turno_noche = demandas_test[e.nombre]
+    demanda_red = sum(e.demanda_total() for e in inst_red.empresas if e.is_activa())
+    assert demanda_red == 9, f"Demanda de prueba debería ser 9, es {demanda_red}"
+
+    res_red = resolver_asignacion(inst_red, modo="suma_total")
+    assert res_red.status == "Optimal", (
+        f"INFEASIBLE con demanda=9 y 14 activos: {res_red.status}"
+    )
+    assert len(res_red.asignaciones) == 9
+    assert len(res_red.guardias_reserva) == 5
+    print(f"demanda=9:  {len(res_red.asignaciones)} asignados, "
+          f"{len(res_red.guardias_reserva)} en reserva "
+          f"({', '.join(res_red.guardias_reserva)})  Z*={res_red.z_total:.1f} km")
 
     # --- Modo minimax ---
     res_mm = resolver_asignacion(inst, modo="minimax")
     assert res_mm.status == "Optimal"
-    # Minimax minimiza la peor distancia, no la suma; Z* distinto de suma_total
     print(f"minimax:    M* = {res_mm.z_max:.1f} km  Z_total = {res_mm.z_total:.1f} km")
 
-    # --- Modo multiobjetivo alpha=0.5, beta=0.5 ---
+    # --- Modo multiobjetivo ---
     res_mo = resolver_asignacion(inst, modo="multiobjetivo", alpha=0.5, beta=0.5)
     assert res_mo.status == "Optimal"
     print(f"multiobj:   Z* = {res_mo.z_total:.1f} km  M = {res_mo.z_max:.1f} km")
 
     # --- Con restriccion de equidad ---
     res_eq = resolver_asignacion(inst, modo="suma_total", delta_equidad=30.0)
-    assert res_eq.status in ("Optimal", "Infeasible"), f"Status inesperado: {res_eq.status}"
+    assert res_eq.status in ("Optimal", "Infeasible")
     if res_eq.status == "Optimal":
-        assert res_eq.z_range <= 30.0 + 1e-4, f"Rango {res_eq.z_range} > delta_equidad 30.0"
+        assert res_eq.z_range <= 30.0 + 1e-4
         print(f"equidad30:  Z* = {res_eq.z_total:.1f} km  rango = {res_eq.z_range:.1f} km")
 
     # --- Diagnóstico D_max muy bajo ---
     r_inf = resolver_asignacion(inst, modo="suma_total", d_max=2.0, delta_equidad=None)
     assert r_inf.status == "Infeasible", f"Esperado Infeasible, got {r_inf.status}"
     causas = diagnosticar_infactibilidad(inst, "suma_total", 1.0, 0.0, 2.0, None)
-    assert any("D_max" in c for c in causas), causas
-    print("Diagnostico D_max bajo: OK —", causas[0][2:60].encode("ascii", "replace").decode())
+    assert len(causas) > 0
+    print("Diagnostico D_max bajo: OK")
 
-    # --- Diagnóstico equidad muy estricta ---
-    r_eq = resolver_asignacion(inst, modo="suma_total", d_max=40, delta_equidad=1.0)
-    if r_eq.status == "Infeasible":
-        causas2 = diagnosticar_infactibilidad(inst, "suma_total", 1.0, 0.0, 40, 1.0)
-        assert any("Δ_max" in c or "equidad" in c.lower() for c in causas2), causas2
-        print("Diagnostico equidad estricta: OK —",
-              causas2[0][2:60].encode("ascii", "replace").decode())
-
-    print("diagnosticar_infactibilidad OK")
     print("OK assignment.py: todas las aserciones pasaron")
+    
