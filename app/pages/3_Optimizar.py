@@ -103,9 +103,20 @@ def _init_state() -> None:
 # Helpers nucleares
 # ---------------------------------------------------------------------------
 
-def _params_key(params: dict) -> str:
+def _params_key(params: dict, inst: BursanInstance) -> str:
+    """Clave única que combina parámetros del solver Y estado de la instancia.
+    Si cambia la demanda o los guardias activos, la clave cambia y se fuerza
+    una nueva ejecución en lugar de mostrar el resultado anterior cacheado."""
+    inst_sig = {
+        "n_activos": len(inst.guardias_activos()),
+        "demanda": {
+            e.nombre: (e.turno_dia, e.turno_noche)
+            for e in inst.empresas if e.is_activa()
+        },
+    }
     return json.dumps(
-        {k: (v if v is not None else "null") for k, v in sorted(params.items())},
+        {k: (v if v is not None else "null") for k, v in sorted(params.items())}
+        | {"_inst": inst_sig},
         sort_keys=True,
     )
 
@@ -831,7 +842,7 @@ st.caption(
 )
 
 if do_optimize:
-    pkey = _params_key(params)
+    pkey = _params_key(params, inst)
     if st.session_state.opt_params_key != pkey:
         with st.spinner("Resolviendo ILP + CVRP..."):
             inst_opt, asignacion, routing = _run_optimization(inst, params)
@@ -839,7 +850,14 @@ if do_optimize:
         st.session_state.opt_params_key = pkey
         st.session_state.sens_results   = None
     else:
-        st.info("Resultado en cache — los parametros no cambiaron desde la ultima ejecucion.")
+        st.info("Resultado en cache — los parametros e instancia no cambiaron desde la ultima ejecucion.")
+
+# Si la instancia cambió (demanda, guardias) respecto al resultado cacheado,
+# descartamos ese resultado para evitar mostrar datos desincronizados.
+_current_key = _params_key(params, inst)
+if st.session_state.opt_params_key is not None and st.session_state.opt_params_key != _current_key:
+    st.session_state.opt_result     = None
+    st.session_state.opt_params_key = None
 
 result = st.session_state.opt_result
 
