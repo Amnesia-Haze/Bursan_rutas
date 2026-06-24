@@ -41,8 +41,9 @@ def recargar_instancia(data_dir: str = "data") -> BursanInstance:
     st.session_state["instance_loaded_at"] = datetime.now().strftime("%H:%M:%S")
 
     # Invalidar resultado de optimización anterior: ya no corresponde
-    # a los datos actuales
-    for key in ("last_result", "last_asignacion", "last_rutas"):
+    # a los datos actuales (incluye claves de 3_Optimizar.py)
+    for key in ("last_result", "last_asignacion", "last_rutas",
+                "opt_result", "opt_params_key", "sens_results", "sens_param"):
         if key in st.session_state:
             del st.session_state[key]
 

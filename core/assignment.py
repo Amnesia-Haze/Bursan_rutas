@@ -346,10 +346,12 @@ def diagnosticar_infactibilidad(
                     f"cercanos a {e.nombre}."
                 )
 
-    # 3) Supervisor disponible para empresas que lo requieren
+    # 3) Supervisor disponible para empresas que lo requieren.
+    # Se usa el d_max REAL (no 9999) para aislar solo el efecto de R3.
+    # Si con el mismo d_max pero sin R3 el problema es factible, entonces R3 es la causa.
     supervisores = [g for g in guardias if g.supervisor]
     r_sin_r3 = resolver_asignacion(
-        inst, modo=modo, alpha=alpha, beta=beta, d_max=9999,
+        inst, modo=modo, alpha=alpha, beta=beta, d_max=d_max,
         delta_equidad=None, tiempo_limite=tiempo_limite, _ignorar_supervisor=True,
     )
     if r_sin_r3.status == "Optimal":
