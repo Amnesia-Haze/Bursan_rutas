@@ -16,12 +16,13 @@ except ImportError:
 # ── Carga opcional de variables de entorno desde .env ────────────────────────
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(Path(__file__).parent.parent / ".env")  # siempre desde bursan_rutas/
 except ImportError:
     pass
 
-_ROOT       = Path(__file__).parent.parent          # bursan_rutas/
-_CACHE_FILE = _ROOT / "data" / "distance_cache.json"
+_ROOT            = Path(__file__).parent.parent          # bursan_rutas/
+_CACHE_FILE      = _ROOT / "data" / "distance_cache.json"
+_GEOM_CACHE_FILE = _ROOT / "data" / "route_geometry_cache.json"
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +80,25 @@ def _save_cache(cache: dict) -> None:
         _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _CACHE_FILE.write_text(json.dumps(cache, indent=2, ensure_ascii=False),
                                encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_geom_cache() -> dict:
+    try:
+        if _GEOM_CACHE_FILE.exists():
+            return json.loads(_GEOM_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_geom_cache(cache: dict) -> None:
+    try:
+        _GEOM_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _GEOM_CACHE_FILE.write_text(
+            json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
     except Exception:
         pass
 
@@ -157,6 +177,7 @@ def get_distance_matrix(
 
 def get_route_geometry(
     waypoints: list[tuple[float, float]],
+    use_cache: bool = True,
 ) -> list[tuple[float, float]] | None:
     """
     Obtiene el trazado real por carretera entre los waypoints usando ORS directions.
@@ -164,15 +185,28 @@ def get_route_geometry(
     Parámetros
     ----------
     waypoints : lista de (lat, lon) — convención del sistema.
+    use_cache : busca / escribe en data/route_geometry_cache.json.
 
     Retorna
     -------
-    Lista de (lat, lon) del polilínea real, o None si ORS no está disponible.
+    Lista de (lat, lon) de la polilínea real, o None si ORS no está disponible.
 
     Nota: ORS GeoJSON devuelve coordenadas en [lon, lat] — se invierten aquí.
     """
+    import warnings
+
+    key = _cache_key(waypoints)
+
+    # 1) Caché en disco — evita llamadas repetidas al API en cada render
+    if use_cache:
+        cache = _load_geom_cache()
+        if key in cache:
+            return [(p[0], p[1]) for p in cache[key]]
+
+    # 2) OpenRouteService
     client = _get_ors_client()
     if client is None:
+        warnings.warn("get_route_geometry: ORS_API_KEY no configurada — usando líneas rectas")
         return None
     try:
         ors_coords = [(lon, lat) for lat, lon in waypoints]  # ORS quiere (lon, lat)
@@ -183,8 +217,14 @@ def get_route_geometry(
         )
         # GeoJSON LineString: cada punto es [lon, lat] o [lon, lat, elevation]
         geom_coords = result["features"][0]["geometry"]["coordinates"]
-        return [(lat, lon) for lon, lat, *_ in geom_coords]
-    except Exception:
+        pts = [(lat, lon) for lon, lat, *_ in geom_coords]
+        if use_cache and pts:
+            cache = _load_geom_cache()
+            cache[key] = [[p[0], p[1]] for p in pts]
+            _save_geom_cache(cache)
+        return pts
+    except Exception as exc:
+        warnings.warn(f"get_route_geometry: ORS directions falló ({exc}) — usando líneas rectas")
         return None
 
 
